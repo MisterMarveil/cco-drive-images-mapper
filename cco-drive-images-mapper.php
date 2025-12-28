@@ -6,25 +6,52 @@
  */
 
 if (!defined('ABSPATH')) exit;
+define( 'MON_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
+define( 'MON_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 
 class CCO_Drive_Images_Mapper {
+    private bool $audit_only = false;
+    private string $log_dir;
+    private string $log_file;
+    private string $csv_file;
 
     // IMPORTANT: adapte le dossier WP uploads (année/mois)
     private string $uploads_base = 'https://cco-237.shop/wp-content/uploads/2025/05/';
 
     // Mets ici le chemin vers ton JSON de service account (stocke-le hors webroot si possible)
     // Exemple: /home/bridge/secure/google/service-account.json
-    private string $service_account_json_path = WP_CONTENT_DIR . '/uploads/cco-service-account.json';
+    private string $service_account_json_path = MON_PLUGIN_DIR . 'key.json';
 
     // Cache (évite de re-caller l’API pour le même fileId)
     private int $cache_ttl = 86400; // 24h
 
     public function __construct() {
+        $this->log_dir  = WP_CONTENT_DIR . '/uploads/cco-import-logs';
+        $this->log_file = $this->log_dir . '/missing-images-' . date('Y-m') . '.log';
+        $this->csv_file = $this->log_dir . '/missing-images-' . date('Y-m') . '.csv';
+        $this->audit_only = (bool) get_option('cco_drive_audit_only', false);
+
+
+        if (!is_dir($this->log_dir)) {
+            wp_mkdir_p($this->log_dir);
+        }
+
+        if (!file_exists($this->csv_file)) {
+            file_put_contents(
+                $this->csv_file,
+                "date,sku,product_name,drive_file_id,drive_name,expected_url,reason\n"
+            );
+        }
+
         // Hook WooCommerce Product CSV Importer
         add_filter('woocommerce_product_importer_pre_process_csv_row', [$this, 'filter_import_row'], 10, 2);
 
         // Optionnel : page d’admin pour config rapide
         add_action('admin_menu', [$this, 'admin_menu']);
+
+        add_action('admin_init', function () {
+            register_setting('cco_drive_settings', 'cco_drive_audit_only');
+        });
     }
 
     public function admin_menu() {
@@ -44,6 +71,25 @@ class CCO_Drive_Images_Mapper {
         echo '<p><strong>Service account JSON attendu :</strong><br><code>' . esc_html($this->service_account_json_path) . '</code></p>';
         echo '<p><strong>Uploads base :</strong><br><code>' . esc_html($this->uploads_base) . '</code></p>';
         echo '</div>';
+
+        echo '<form method="post" action="options.php">';
+        settings_fields('cco_drive_settings');
+        do_settings_sections('cco_drive_settings');
+
+        echo '<table class="form-table">';
+        echo '<tr>';
+        echo '<th scope="row">Mode audit uniquement</th>';
+        echo '<td>';
+        echo '<label>';
+        echo '<input type="checkbox" name="cco_drive_audit_only" value="1" ' . checked(1, get_option('cco_drive_audit_only'), false) . ' />';
+        echo ' Activer le mode audit (aucune image ne sera modifiée lors de l’import)';
+        echo '</label>';
+        echo '</td>';
+        echo '</tr>';
+        echo '</table>';
+
+        submit_button();
+        echo '</form>';
     }
 
     /**
@@ -65,12 +111,20 @@ class CCO_Drive_Images_Mapper {
 
         if (!$key) return $data;
 
-        $data[$key] = $this->transform_images_field($data[$key]);
+        //$data[$key] = $this->transform_images_field($data[$key]);
+        $data[$key] = $this->transform_images_field($data[$key], $data);
+
 
         return $data;
     }
 
-    private function transform_images_field(string $value) : string {
+    private function transform_images_field(string $value, array $data = []) : string{
+        // MODE AUDIT : on ne modifie rien, on analyse seulement
+        if ($this->audit_only) {
+            $this->audit_images($value, $data);
+            return $value; // ⚠️ CRUCIAL : on retourne la valeur d’origine
+        }
+
         $urls = $this->split_urls($value);
         if (!$urls) return $value;
 
@@ -94,13 +148,54 @@ class CCO_Drive_Images_Mapper {
             // fileId -> filename via Drive API
             $filename = $this->drive_get_filename($fileId);
             if (!$filename) {
-                // fallback : on garde le lien drive si échec
+                $this->log_missing_image([
+                    'sku'      => $data['sku'] ?? '',
+                    'product'  => $data['name'] ?? '',
+                    'file_id'  => $fileId,
+                    'filename' => '',
+                    'url'      => '',
+                    'reason'   => 'drive_filename_not_resolved',
+                ]);
+
                 if (!isset($seen[$u])) {
                     $out[] = $u;
                     $seen[$u] = true;
                 }
                 continue;
             }
+
+            // Nom sans extension (ex: 238)
+            $base = pathinfo($filename, PATHINFO_FILENAME);
+
+            // Extensions tolérées
+            $extensions = ['png', 'jpg', 'jpeg', 'webp'];
+            $found = false;
+
+            foreach ($extensions as $ext) {
+
+                $candidate = $this->uploads_base . $base . '.' . $ext;
+
+                if ($this->image_exists($candidate)) {
+                    if (!isset($seen[$candidate])) {
+                        $out[] = $candidate;
+                        $seen[$candidate] = true;
+                    }
+                    $found = true;
+                    break;
+                }
+            }
+
+            if (!$found) {
+                $this->log_missing_image([
+                    'sku'      => $data['sku'] ?? '',
+                    'product'  => $data['name'] ?? '',
+                    'file_id'  => $fileId,
+                    'filename' => $filename,
+                    'url'      => $this->uploads_base . $filename,
+                    'reason'   => 'image_not_found_on_cco',
+                ]);
+            }
+
 
             $local = $this->uploads_base . rawurlencode($filename);
             if (!isset($seen[$local])) {
@@ -111,6 +206,55 @@ class CCO_Drive_Images_Mapper {
 
         return implode(',', $out);
     }
+
+    private function audit_images(string $value, array $data = []): void {
+        $urls = $this->split_urls($value);
+        if (!$urls) return;
+
+        foreach ($urls as $u) {
+
+            $fileId = $this->extract_drive_file_id($u);
+            if (!$fileId) continue;
+
+            $filename = $this->drive_get_filename($fileId);
+
+            if (!$filename) {
+                $this->log_missing_image([
+                    'sku'      => $data['sku'] ?? '',
+                    'product'  => $data['name'] ?? '',
+                    'file_id'  => $fileId,
+                    'filename' => '',
+                    'url'      => '',
+                    'reason'   => 'drive_filename_not_resolved (audit)',
+                ]);
+                continue;
+            }
+
+            $base = pathinfo($filename, PATHINFO_FILENAME);
+            $extensions = ['png', 'jpg', 'jpeg', 'webp'];
+            $found = false;
+
+            foreach ($extensions as $ext) {
+                $candidate = $this->uploads_base . $base . '.' . $ext;
+                if ($this->image_exists($candidate)) {
+                    $found = true;
+                    break;
+                }
+            }
+
+            if (!$found) {
+                $this->log_missing_image([
+                    'sku'      => $data['sku'] ?? '',
+                    'product'  => $data['name'] ?? '',
+                    'file_id'  => $fileId,
+                    'filename' => $filename,
+                    'url'      => $this->uploads_base . $filename,
+                    'reason'   => 'image_not_found_on_cco (audit)',
+                ]);
+            }
+        }
+    }
+
 
     private function split_urls(string $value) : array {
         $parts = preg_split('/[,\n;]+/', $value);
@@ -226,6 +370,41 @@ class CCO_Drive_Images_Mapper {
     private function base64url_encode(string $data) : string {
         return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
     }
+
+    private function image_exists(string $url): bool {
+        $resp = wp_remote_head($url, ['timeout' => 10]);
+        if (is_wp_error($resp)) return false;
+        return wp_remote_retrieve_response_code($resp) === 200;
+    }
+
+    private function log_missing_image(array $context): void {
+        $line = sprintf(
+            "[%s] SKU=%s | PRODUCT=%s | DRIVE_ID=%s | NAME=%s | URL=%s | REASON=%s\n",
+            date('Y-m-d H:i:s'),
+            $context['sku'] ?? '',
+            $context['product'] ?? '',
+            $context['file_id'] ?? '',
+            $context['filename'] ?? '',
+            $context['url'] ?? '',
+            $context['reason'] ?? ''
+        );
+
+        file_put_contents($this->log_file, $line, FILE_APPEND);
+
+        $csv = sprintf(
+            "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
+            date('Y-m-d H:i:s'),
+            $context['sku'] ?? '',
+            $context['product'] ?? '',
+            $context['file_id'] ?? '',
+            $context['filename'] ?? '',
+            $context['url'] ?? '',
+            $context['reason'] ?? ''
+        );
+
+        file_put_contents($this->csv_file, $csv, FILE_APPEND);
+    }
+
 }
 
 new CCO_Drive_Images_Mapper();
